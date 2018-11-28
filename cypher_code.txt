@@ -1,0 +1,305 @@
+# Importing the dataset
+
+CREATE CONSTRAINT ON (m:Movie) ASSERT m.id IS UNIQUE;
+CREATE CONSTRAINT ON (u:User) ASSERT u.id IS UNIQUE;
+USING PERIODIC COMMIT LOAD CSV WITH HEADERS
+FROM "http://people.irisa.fr/Nikolaos.Parlavantzas/nosql/movies.csv" AS
+line
+WITH line, SPLIT(line.genres, "|") AS Genres
+CREATE (m:Movie { id: TOINTEGER(line.`movieId`), title: line.`title` })
+WITH Genres, m
+UNWIND RANGE(0, SIZE(Genres)-1) as i
+MERGE (g:Genre {name: toUpper(Genres[i])})
+CREATE (m)-[r:HAS_GENRE {position:i+1}]->(g);
+USING PERIODIC COMMIT LOAD CSV WITH HEADERS
+FROM "http://people.irisa.fr/Nikolaos.Parlavantzas/nosql/ratings.csv" AS
+line
+WITH line
+MATCH (m:Movie { id: TOINTEGER(line.`movieId`) })
+MERGE (u:User { id: TOINTEGER(line.`userId`) })
+CREATE (u)-[r:RATED {rating: TOFLOAT(line.`rating`)}]->(m);
+
+# Cosine sim:
+
+MATCH (u1:User {id: 10})-[x:RATED]->(m:Movie)<-[y:RATED]-(u2:User)
+WITH COUNT(m) AS numbermovies, SUM(x.rating * y.rating) AS xyDotProduct, SQRT(REDUCE(xDot = 0.0, a IN COLLECT(x.rating) | xDot + a^2)) AS xLength, SQRT(REDUCE(yDot = 0.0, b IN COLLECT(y.rating) | yDot + b^2)) AS yLength, u1, u2 WHERE numbermovies > 10
+WITH u1, u2, xyDotProduct / (xLength * yLength) AS cosine
+MATCH (u2)-[r:RATED]->(m:Movie) WHERE NOT EXISTS( (u1)-[:RATED]->(m))
+WITH m.title AS title, u2, cosine, r.rating AS rate
+ORDER BY cosine DESC
+WITH title, COLLECT(rate)[0..10] AS rating
+WITH title, REDUCE(s=0, i IN rating | s+i)/LENGTH(rating) AS score
+ORDER BY score DESC
+RETURN title, score
+
+# Removing five movies for user 10 to calculate predictions:
+
+MATCH (u:User {id: 10})-[r:RATED]->(m:Movie {title: "Three Kings (1999)"})
+DELETE r
+MATCH (u:User {id: 10})-[r:RATED]->(m:Movie {title: "Hairspray (1988)"})
+DELETE r
+MATCH (u:User {id: 10})-[r:RATED]->(m:Movie {title: "Batman (1989)"})
+DELETE r
+MATCH (u:User {id: 10})-[r:RATED]->(m:Movie {title: "Aliens (1986)"})
+DELETE r
+MATCH (u:User {id: 10})-[r:RATED]->(m:Movie {title: "Matrix, The (1999)"})
+DELETE r
+
+
+# Pearson sim:
+
+MATCH (u1:User {id:10})-[r:RATED]->(m:Movie)
+WITH u1, avg(r.rating) AS u1_mean
+MATCH (u1)-[r1:RATED]->(m:Movie)<-[r2:RATED]-(u2)
+WITH u1, u1_mean, u2, COLLECT({r1:r1, r2:r2}) AS ratings WHERE size(ratings) > 10
+MATCH (u2)-[r:RATED]->(m:Movie) WITH u1,u1_mean, u2, avg(r.rating) AS u2_mean, ratings
+UNWIND ratings as r
+WITH sum((r.r1.rating-u1_mean)*(r.r2.rating-u2_mean)) AS nom,
+     sqrt(sum((r.r1.rating-u1_mean )^2)*sum((r.r2.rating-u2_mean)^22)) AS denom,
+     u1, u2 WHERE denom <> 0
+WITH u1, u2, nom/denom AS pearson
+MATCH (u2)-[r:RATED]->(m:Movie) WHERE NOT EXISTS( (u1)-[:RATED]->(m) ) WITH m.title AS title, u2, pearson, r.rating AS rate
+ORDER BY pearson DESC
+WITH title, COLLECT(rate)[0..10] AS rating
+WITH title, REDUCE(s=0, i IN rating | s+i)/LENGTH(rating) AS score
+ORDER BY score DESC
+RETURN title, score
+
+
+
+# Reccommends 5 movies to user 123, using genre-based content-filtering
+MATCH (u:User {id: 123})-[r:RATED]->(m:Movie),
+  (m)-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS ((u)-[:RATED]->(rec))
+WITH rec, [g.name, COUNT(*)] AS scores
+RETURN rec.title AS recommendation, COLLECT(scores) AS scoreComponents,
+REDUCE (s=0,x in COLLECT(scores) | s+x[1]) AS score
+ORDER BY score DESC LIMIT 5
+
+
+# Recommends 5 movies based on other movie genres that the user has actually liked
+# (ie above average rating)
+MATCH (u:User {id: 123})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+
+
+
+######################################################
+######### TO TEST
+######################################################
+
+# Returns all "relevant ratings" (ie above 3.5) in descending order
+MATCH (:User {id: 123})-[r:RATED]->(m:Movie)
+WITH r.rating AS rating, m.title AS movie
+WHERE r.rating > 3.5
+RETURN rating, movie
+ORDER BY rating DESC
+
+# Remove 5 ratings by hand, corresponding to the 3rd, 6th, 9th , 12th and 15th ratings
+MATCH (u:User {id: 123})-[r:RATED]->(f:Movie {title: "Sixth Sense, The (1999)"}),
+(u)-[m:RATED]->(n:Movie {title: "Creepshow (1982)"}),
+(u)-[l:RATED]->(o:Movie {title: "Final Destination (2000)"}),
+(u)-[k:RATED]->(i:Movie {title: "Natural Born Killers (1994)"}),
+(u)-[e:RATED]->(w:Movie {title: "Critters (1986)"})
+DELETE r,m,l,k,e
+
+# Retrains recommendations, without those five movies
+MATCH (u:User {id: 123})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+# Finds jaccard indexes of the removed movies with the most highly rated movie recommended of new collection
+# In this case, Rubber (2010). We inserted each movie in turn by hand (excess code not included but easiy replicated
+# by replacing the movie name with the previous list of 5 movies
+MATCH (m:Movie {title: "Rubber (2010)"})-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(other:Movie {title: "Critters (1986)"})
+WITH m, other, COUNT(g) AS intersection, COLLECT(g.name) AS i
+MATCH (m)-[:HAS_GENRE]->(mg:Genre)
+WITH m,other, intersection,i, COLLECT(mg.name) AS s1
+MATCH (other)-[:HAS_GENRE]->(og:Genre)
+WITH m,other,intersection,i, s1, COLLECT(og.name) AS s2
+WITH m,other,intersection,s1,s2
+WITH m,other,intersection,s1+filter(x IN s2 WHERE NOT x IN s1) AS union, s1, s2
+RETURN m.title, other.title, s1,s2,((1.0*intersection)/SIZE(union)) AS jaccard ORDER BY jaccard DESC LIMIT 100
+
+
+
+
+
+#######################
+# Testing user 345
+##########################
+
+MATCH (:User {id: 345})-[r:RATED]->(m:Movie)
+WITH r.rating AS rating, m.title AS movie
+WHERE r.rating > 3.5
+RETURN rating, movie
+ORDER BY rating DESC
+
+
+MATCH (u:User {id: 345})-[r:RATED]->(f:Movie {title: "Run Lola Run (Lola rennt) (1998)"}),
+(u)-[m:RATED]->(n:Movie {title: "Kill Bill: Vol. 1 (2003)"}),
+(u)-[l:RATED]->(o:Movie {title: "Lost in Translation (2003)"}),
+(u)-[k:RATED]->(i:Movie {title: "Donnie Darko (2001)"}),
+(u)-[e:RATED]->(w:Movie {title: "Diner (1982)"})
+DELETE r,m,l,k,e
+
+
+# To test the user's movies
+MATCH (u:User {id: 345})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+
+# to test the jaccard indexes of the removed movies with the most
+# highly rated movie recommended, which is strangely Rubeber (2010) again!
+MATCH (m:Movie {title: "Rubber (2010)"})-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(other:Movie {title: "Run Lola Run (Lola rennt) (1998)"})
+WITH m, other, COUNT(g) AS intersection, COLLECT(g.name) AS i
+MATCH (m)-[:HAS_GENRE]->(mg:Genre)
+WITH m,other, intersection,i, COLLECT(mg.name) AS s1
+MATCH (other)-[:HAS_GENRE]->(og:Genre)
+WITH m,other,intersection,i, s1, COLLECT(og.name) AS s2
+WITH m,other,intersection,s1,s2
+WITH m,other,intersection,s1+filter(x IN s2 WHERE NOT x IN s1) AS union, s1, s2
+RETURN m.title, other.title, s1,s2,((1.0*intersection)/SIZE(union)) AS jaccard ORDER BY jaccard DESC LIMIT 100
+
+
+#######################
+# Testing user 54
+##########################
+
+MATCH (:User {id: 54})-[r:RATED]->(m:Movie)
+WITH r.rating AS rating, m.title AS movie
+WHERE r.rating > 3.5
+RETURN rating, movie
+ORDER BY rating DESC
+
+MATCH (u:User {id: 54})-[r:RATED]->(f:Movie {title: "P.S. I Love You (2007)"}),
+(u)-[m:RATED]->(n:Movie {title: "12 Angry Men (1997)"}),
+(u)-[l:RATED]->(o:Movie {title: "Italian Job, The (2003)"}),
+(u)-[k:RATED]->(i:Movie {title: "Find Me Guilty (2006)"}),
+(u)-[e:RATED]->(w:Movie {title: "Good, the Bad and the Ugly, The (Buono, il brutto, il cattivo, Il) (1966)"})
+DELETE r,m,l,k,e
+
+MATCH (u:User {id: 345})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+# Compare Jaccard Index with top rated movie, in this case Motorama (1991)
+MATCH (m:Movie {title: "Motorama (1991)"})-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(other:Movie {title: "P.S. I Love You (2007)"})
+WITH m, other, COUNT(g) AS intersection, COLLECT(g.name) AS i
+MATCH (m)-[:HAS_GENRE]->(mg:Genre)
+WITH m,other, intersection,i, COLLECT(mg.name) AS s1
+MATCH (other)-[:HAS_GENRE]->(og:Genre)
+WITH m,other,intersection,i, s1, COLLECT(og.name) AS s2
+WITH m,other,intersection,s1,s2
+WITH m,other,intersection,s1+filter(x IN s2 WHERE NOT x IN s1) AS union, s1, s2
+RETURN m.title, other.title, s1,s2,((1.0*intersection)/SIZE(union)) AS jaccard ORDER BY jaccard DESC LIMIT 100
+
+
+
+#######################
+# Testing user 574
+##########################
+
+MATCH (:User {id: 574})-[r:RATED]->(m:Movie)
+WITH r.rating AS rating, m.title AS movie
+WHERE r.rating > 3.5
+RETURN rating, movie
+ORDER BY rating DESC
+
+MATCH (u:User {id: 574})-[r:RATED]->(f:Movie {title: "Usual Suspects, The (1995)"}),
+(u)-[m:RATED]->(n:Movie {title: "Pulp Fiction (1994)"}),
+(u)-[l:RATED]->(o:Movie {title: "American Beauty (1999)"}),
+(u)-[k:RATED]->(i:Movie {title: "Twelve Monkeys (a.k.a. 12 Monkeys) (1995)"}),
+(u)-[e:RATED]->(w:Movie {title: "Forrest Gump (1994)"})
+DELETE r,m,l,k,e
+
+MATCH (u:User {id: 574})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+# Compare Jaccard Index with top rated movie, in this case Rubber (2010) again!
+MATCH (m:Movie {title: "Rubber (2010)"})-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(other:Movie {title: "Usual Suspects, The (1995)"})
+WITH m, other, COUNT(g) AS intersection, COLLECT(g.name) AS i
+MATCH (m)-[:HAS_GENRE]->(mg:Genre)
+WITH m,other, intersection,i, COLLECT(mg.name) AS s1
+MATCH (other)-[:HAS_GENRE]->(og:Genre)
+WITH m,other,intersection,i, s1, COLLECT(og.name) AS s2
+WITH m,other,intersection,s1,s2
+WITH m,other,intersection,s1+filter(x IN s2 WHERE NOT x IN s1) AS union, s1, s2
+RETURN m.title, other.title, s1,s2,((1.0*intersection)/SIZE(union)) AS jaccard ORDER BY jaccard DESC LIMIT 100
+
+
+
+
+
+#######################
+# Testing user 200
+##########################
+
+MATCH (:User {id: 200})-[r:RATED]->(m:Movie)
+WITH r.rating AS rating, m.title AS movie
+WHERE r.rating > 3.5
+RETURN rating, movie
+ORDER BY rating DESC
+
+MATCH (u:User {id: 200})-[r:RATED]->(f:Movie {title: "Game, The (1997)"}),
+(u)-[m:RATED]->(n:Movie {title: "Over the Hedge (2006)"}),
+(u)-[l:RATED]->(o:Movie {title:	"I Am Legend (2007)"}),
+(u)-[k:RATED]->(i:Movie {title: "Blood Diamond (2006)"}),
+(u)-[e:RATED]->(w:Movie {title: "21 (2008)"})
+DELETE r,m,l,k,e
+
+MATCH (u:User {id: 200})-[r:RATED]->(m:Movie)
+WITH u, avg(r.rating) AS mean
+MATCH (u)-[r:RATED]->(m:Movie)-[:HAS_GENRE]->(g:Genre)
+WHERE r.rating > mean
+WITH u, g, COUNT(*) AS score
+MATCH (g)<-[:HAS_GENRE]-(rec:Movie)
+WHERE NOT EXISTS((u)-[:RATED]->(rec))
+RETURN rec.title AS recommendation, rec.year AS year, COLLECT(DISTINCT g.name) AS genres, SUM(score) AS sscore
+ORDER BY sscore DESC LIMIT 10
+
+# Compare Jaccard Index with top rated movie, in this case Rubber (2010) again!
+MATCH (m:Movie {title: "Rubber (2010)"})-[:HAS_GENRE]->(g:Genre)<-[:HAS_GENRE]-(other:Movie {title: "Game, The (1997)"})
+WITH m, other, COUNT(g) AS intersection, COLLECT(g.name) AS i
+MATCH (m)-[:HAS_GENRE]->(mg:Genre)
+WITH m,other, intersection,i, COLLECT(mg.name) AS s1
+MATCH (other)-[:HAS_GENRE]->(og:Genre)
+WITH m,other,intersection,i, s1, COLLECT(og.name) AS s2
+WITH m,other,intersection,s1,s2
+WITH m,other,intersection,s1+filter(x IN s2 WHERE NOT x IN s1) AS union, s1, s2
+RETURN m.title, other.title, s1,s2,((1.0*intersection)/SIZE(union)) AS jaccard ORDER BY jaccard DESC LIMIT 100
+
